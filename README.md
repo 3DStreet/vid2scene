@@ -8,6 +8,52 @@ Turn a phone video into an interactive 3D Gaussian-Splat scene. Open-source self
 
 ---
 
+## Architecture
+
+vid2scene is a small distributed system: a Django web app hosts the vid2scene web platform — the site, accounts, REST API, upload flow, and in-browser 3D viewer — a separate GPU worker runs the heavy 3D-reconstruction pipeline, and the two coordinate through a job queue, a database, and blob storage.
+
+```
+   ┌─────────┐
+   │ browser │
+   └─────────┘
+     │      │
+HTTP │      │ direct SAS (browser ⇄ blob storage)
+     ▼      └──────────────────────────────────┐
+   ┌─────────────────────────────┐             │
+   │ web — Django + gunicorn      │             │
+   │ (port 8000)                  │             │
+   └─────────────────────────────┘             │
+     │            │            │               │
+     │ enqueue    │ read /     │ server-side   │
+     │ (RQ)       │ write      │ blob I/O      │
+     ▼            ▼            ▼               ▼
+   ┌───────┐  ┌──────────┐  ┌──────────────────────────────┐
+   │ redis │  │ postgres │  │ azurite (Azure Blob emulator)│
+   └───────┘  └──────────┘  └──────────────────────────────┘
+     │                            ▲
+     │ job                        │ server-side blob I/O
+     ▼                            │
+   ┌──────────────┐               │
+   │ worker (GPU) │───────────────┘
+   └──────────────┘
+```
+
+| Service | Image | Role |
+|---|---|---|
+| `web` | [`Web_Dockerfile`](Web_Dockerfile) (`python:3.11-slim` + `gunicorn`, frontend built in a Node stage) | Django app, REST API, and splat viewer. Accepts uploads and **enqueues** processing jobs. |
+| `worker` | [`Worker_Dockerfile`](Worker_Dockerfile) (PyTorch + CUDA + COLMAP/glomap/gsplat from source) | Pulls jobs off the queue and runs the ML pipeline: frame extraction, SfM, splat training, LOD/SPZ/SOG export. |
+| `redis` | `redis:7` | Two roles: the **[django-rq](https://github.com/rq/django-rq)** job queue — a Redis-backed task queue where `web` pushes jobs and `worker` pops them — and the Django cache. |
+| `postgres` | `postgres:16` | Primary database: users, jobs, and scene metadata (titles, camera framing, file paths). |
+| `azurite` | `mcr.microsoft.com/azure-storage/azurite` | **[Azurite](https://github.com/Azure/Azurite)**, Microsoft's Azure Blob Storage emulator. **All scenes live here** — uploaded videos and the generated splat files (PLY/SPZ/SOG/LOD) and previews. The browser uploads/downloads them directly via short-lived SAS URLs. |
+
+**How a job flows:** the browser uploads the video straight to blob storage via a SAS URL, then asks `web` to create a job. `web` writes a row to Postgres and pushes a task onto the django-rq queue in Redis. The `worker` pops it, runs the pipeline on the GPU, writes the resulting scene files back to blob storage, and updates the job in Postgres. The browser polls status and finally loads the finished scene straight from blob storage.
+
+The pipeline itself lives in [`vid2scene_core/`](vid2scene_core/) and is orchestrated by the worker. SfM defaults to GLOMAP (no model weights needed). VGGT and SAM3-based panorama background removal are opt-in and require a Hugging Face token (see below).
+
+On the hosted vid2scene deployment each box in the diagram was its own dedicated piece of infrastructure — the web app on one server, one or more GPU workers each on their own server (the django-rq queue lets you scale out by simply adding more workers that pull from it), plus managed Redis, managed PostgreSQL, and real Azure Blob Storage. This self-host stack collapses all of them into a single `docker compose` project on one machine, swapping the managed cloud services for drop-in equivalents (plain Redis/Postgres containers, and **Azurite** standing in for Azure Blob Storage) so it runs with no cloud account.
+
+---
+
 ## Setup guide
 
 A start-to-finish walkthrough from a fresh machine to a running stack. If you already have Docker + NVIDIA GPU support, skip to [step 4](#4-get-the-code).
@@ -99,46 +145,6 @@ The five services — web, worker, redis, postgres, azurite — share host netwo
 
 ---
 
-## Architecture
-
-```
-   ┌─────────┐
-   │ browser │
-   └─────────┘
-     │      │
-HTTP │      │ direct SAS (browser ⇄ blob storage)
-     ▼      └──────────────────────────────────┐
-   ┌─────────────────────────────┐             │
-   │ web — Django + gunicorn      │             │
-   │ (port 8000)                  │             │
-   └─────────────────────────────┘             │
-     │            │            │               │
-     │ enqueue    │ read /     │ server-side   │
-     │ (RQ)       │ write      │ blob I/O      │
-     ▼            ▼            ▼               ▼
-   ┌───────┐  ┌──────────┐  ┌──────────────────────────────┐
-   │ redis │  │ postgres │  │ azurite (Azure Blob emulator)│
-   └───────┘  └──────────┘  └──────────────────────────────┘
-     │                            ▲
-     │ job                        │ server-side blob I/O
-     ▼                            │
-   ┌──────────────┐               │
-   │ worker (GPU) │───────────────┘
-   └──────────────┘
-```
-
-| Service | Image | Role |
-|---|---|---|
-| `web` | [`Web_Dockerfile`](Web_Dockerfile) (`python:3.11-slim` + `gunicorn`, frontend built in a Node stage) | Django app, REST API, splat viewer, job enqueue |
-| `worker` | [`Worker_Dockerfile`](Worker_Dockerfile) (PyTorch + CUDA + COLMAP/glomap/gsplat from source) | The actual ML pipeline: frame extraction, SfM, splat training, LOD/SPZ/SOG export |
-| `redis` | `redis:7` | RQ job queue + Django cache |
-| `postgres` | `postgres:16` | All app state (users, jobs, scenes) |
-| `azurite` | `mcr.microsoft.com/azure-storage/azurite` | Blob storage emulator; the browser uploads/downloads here directly via SAS URLs |
-
-The pipeline lives in [`vid2scene_core/`](vid2scene_core/) and is orchestrated by the worker. SfM defaults to GLOMAP (no model weights needed). VGGT and SAM3-based panorama background removal are opt-in and require a Hugging Face token (see below).
-
----
-
 ## Configuration
 
 Every knob lives in [`.env`](.env.example). All have working defaults; copy and edit what you care about:
@@ -181,7 +187,7 @@ There are a lot of cool features. Definitely try it out!
 
 The default `reconstruction_method=glomap` uses pure C++ SfM and needs **no model weights, no HF account, no token**. Two paths download gated models from HuggingFace and require some one-time setup:
 
-1. **VGGT** (faster but heavier SfM, picked via `reconstruction_method=vggt`) — uses `facebook/VGGT-1B-Commercial`.
+1. **VGGT** (faster SfM, picked via `reconstruction_method=vggt`) — uses `facebook/VGGT-1B-Commercial`. Note: reconstruction quality is **noticeably worse** than the default GLOMAP, so it's mainly useful for quick tests rather than final scenes.
 2. **Equirectangular / 360° background removal** — uses `facebook/sam3`.
 
 To enable either:
