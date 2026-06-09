@@ -96,6 +96,18 @@ def parse_arguments():
         help="Path to Quest project directory (required when using 'quest' reconstruction method).",
     )
     parser.add_argument(
+        "--max_resolution",
+        type=int,
+        help="Maximum long-edge resolution in pixels for extracted frames.",
+        default=1920,
+    )
+    parser.add_argument(
+        "--stop_after_sfm",
+        help="Stop after SfM artifacts are ready (skip gsplat training); resume later with --sfm_dir.",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
         "--apriltag_size",
         type=float,
         help="Physical size of AprilTag in meters (measure outer black border). "
@@ -147,7 +159,7 @@ def prepare_directories(output_dir, sfm_dir):
     return sfm_output_dir, images_output_dir, result_dir, save_ply_path, preview_data_path
 
 
-def handle_images(video_path, image_dir, images_output_dir, target_framecount, equirectangular=False):
+def handle_images(video_path, image_dir, images_output_dir, target_framecount, equirectangular=False, max_resolution=1920):
     if image_dir:
         logger.info(
             f"Copying images from provided directory: {image_dir} to {images_output_dir}"
@@ -157,7 +169,7 @@ def handle_images(video_path, image_dir, images_output_dir, target_framecount, e
 
         logger.info(f"Extracting frames from video to {images_output_dir}...")
         # If equirectangular is true, we don't want to downscale the images, because we'll be splitting them later
-        extract_frames.extract_frames(video_path, images_output_dir, target_framecount, downscale=not equirectangular)
+        extract_frames.extract_frames(video_path, images_output_dir, target_framecount, downscale=not equirectangular, max_resolution=max_resolution)
 
     if equirectangular:
         # Make temp directory for planar projections
@@ -401,8 +413,10 @@ def run_gsplat(gsplat_script, sfm_output_dir, result_dir, save_ply_path, trainin
         logger.info(f"Started watching directory: {preview_data_path}")
 
     try:
-        # Run the command with kill_check
-        process_completed = run_command(gsplat_command, kill_check=kill_check, pipe_stderr=False, pipe_stdout=False)
+        # Run the command with kill_check. Pipe both streams so real trainer
+        # errors surface in the logs (set TQDM_DISABLE=1 in the environment to
+        # keep progress bars from flooding them).
+        process_completed = run_command(gsplat_command, kill_check=kill_check, pipe_stderr=True, pipe_stdout=True)
         if not process_completed:
             logger.info("Gsplat process was terminated by kill_check")
             return None
@@ -478,10 +492,13 @@ def process_video_to_scene(
     apriltag_size_meters=None,
     mock=False,
     quest_project_dir=None,
+    max_resolution=1920,
+    stop_after_sfm=False,
+    normalize_override=None,
 ):
     """
     Process a video into a 3D scene.
-    
+
     Args:
         video_path: Path to the video file
         image_dir: Directory containing images to use instead of extracting frames
@@ -500,9 +517,21 @@ def process_video_to_scene(
         reconstruction_method: Which reconstruction method to use ('glomap', 'colmap', 'vggt', or 'quest')
         apriltag_size_meters: Physical size of AprilTags in meters for scale calibration (None to disable)
         quest_project_dir: Path to Quest project directory (required when using 'quest' reconstruction method)
-        
+        max_resolution: Long-edge pixel cap applied when extracting frames (no upscaling)
+        stop_after_sfm: If True, stop once all SfM-side artifacts (sparse model,
+            images, background sphere/filters) are ready and return the SfM
+            output directory instead of training. Resume later by calling again
+            with sfm_dir=<that directory> (and the image-mutating flags off, so
+            they are not applied twice).
+        normalize_override: If not None, force gsplat world-space normalization
+            on/off instead of deriving it from apriltag/quest. A resumed
+            (sfm_dir=) run that had AprilTag scaling applied in its SfM stage
+            must pass normalize_override=False, since passing
+            apriltag_size_meters again would re-apply the scale factor.
+
     Returns:
-        Path to the output PLY file, or None if processing was terminated
+        Path to the output PLY file; the SfM output directory if
+        stop_after_sfm is True; or None if processing was terminated
     """
     gsplat_script = check_requirements(video_path, image_dir, sfm_dir, reconstruction_method, quest_project_dir)
 
@@ -586,7 +615,7 @@ def process_video_to_scene(
                     logger.warning("VGGT requires low framecount due to memory constraints, setting target_framecount to 35")
                     target_framecount = 35
 
-                handle_images(video_path, image_dir, images_output_dir, target_framecount, equirectangular=False)
+                handle_images(video_path, image_dir, images_output_dir, target_framecount, equirectangular=False, max_resolution=max_resolution)
                 
                 # Check if we should abort after handling images
                 if kill_check and kill_check():
@@ -634,7 +663,14 @@ def process_video_to_scene(
     # Apply Pilgram filter if requested
     if apply_pilgram_filter_name:
         apply_pilgram_filter(images_output_dir, apply_pilgram_filter_name)
-    
+
+    # Everything gsplat consumes (sparse model, images, background sphere,
+    # filters) is now in place — callers that split SfM and training across
+    # machines stop here and resume with sfm_dir= pointed at this directory.
+    if stop_after_sfm:
+        logger.info(f"stop_after_sfm set; SfM artifacts ready in {sfm_output_dir}")
+        return sfm_output_dir
+
     # Calculate mcmc_refine_every for Quest reconstruction (scale with number of images, rounded to nearest 100)
     mcmc_refine_every = None
     if reconstruction_method == 'quest' and num_frames > 0:
@@ -647,7 +683,10 @@ def process_video_to_scene(
     # Run gsplat with the kill_check function
     # Disable world space normalization if AprilTag calibration was used or if using Quest reconstruction
     # (Quest data already comes in world space, AprilTag preserves real-world scale)
-    normalize = apriltag_size_meters is None and reconstruction_method != 'quest'
+    if normalize_override is not None:
+        normalize = normalize_override
+    else:
+        normalize = apriltag_size_meters is None and reconstruction_method != 'quest'
     run_gsplat(gsplat_script, sfm_output_dir, result_dir, save_ply_path, training_max_num_gaussians, training_num_steps,
                preview_data_path, preview_data_handler, kill_check, normalize=normalize, mcmc_refine_every=mcmc_refine_every)
     
@@ -729,4 +768,6 @@ if __name__ == "__main__":
         reconstruction_method=args.reconstruction_method,
         apriltag_size_meters=args.apriltag_size,
         quest_project_dir=args.quest_project_dir,
+        max_resolution=args.max_resolution,
+        stop_after_sfm=args.stop_after_sfm,
     )

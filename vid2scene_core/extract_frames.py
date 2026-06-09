@@ -32,8 +32,11 @@ def get_total_frames(video_path):
     return total_frames
 
 
-def extract_frames(video_path, output_dir, target_framecount=None, downscale=True):
-    """Extract frames using ffmpeg based on the target frame count."""
+def extract_frames(video_path, output_dir, target_framecount=None, downscale=True, max_resolution=1920):
+    """Extract frames using ffmpeg based on the target frame count.
+
+    max_resolution caps the long edge (in pixels) when downscale is True;
+    frames smaller than the cap are never upscaled."""
 
     # Ensure the output directory exists
     os.makedirs(output_dir, exist_ok=True)
@@ -58,7 +61,7 @@ def extract_frames(video_path, output_dir, target_framecount=None, downscale=Tru
     output_pattern = os.path.join(output_dir, "image_%04d.png")
     video_filter_string = f"select=not(mod(n\,{interval}))"
     if downscale:
-        video_filter_string += ",scale=if(gte(iw\,ih)\,min(1920\,iw)\,-2):if(lt(iw\,ih)\,min(1920\,ih)\,-2)"
+        video_filter_string += f",scale=if(gte(iw\,ih)\,min({max_resolution}\,iw)\,-2):if(lt(iw\,ih)\,min({max_resolution}\,ih)\,-2)"
     ffmpeg_command = [
         "ffmpeg",
         "-i",
@@ -92,14 +95,20 @@ def main():
     parser.add_argument(
         "--downscale",
         type=bool,
-        help="Downscale the frames to 1920x1080",
+        help="Downscale the frames to --max_resolution on the long edge",
         default=True,
+    )
+    parser.add_argument(
+        "--max_resolution",
+        type=int,
+        help="Maximum long-edge resolution in pixels when downscaling.",
+        default=1920,
     )
 
     args = parser.parse_args()
 
     # Run frame extraction
-    extract_frames(args.video_path, args.output_dir, args.target_framecount, downscale=args.downscale)
+    extract_frames(args.video_path, args.output_dir, args.target_framecount, downscale=args.downscale, max_resolution=args.max_resolution)
 
 
 if __name__ == "__main__":

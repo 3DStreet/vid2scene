@@ -17,6 +17,27 @@ def _stream_output(pipe, log_func):
         pass  # Pipe has been closed
 
 
+def _log_stderr_line(line):
+    """Log a subprocess stderr line at a level inferred from its content.
+
+    COLMAP/glog (and many CLI tools) write their routine INFO/progress output
+    to stderr, so logging all stderr at ERROR buries real failures in noise.
+    glog lines start with a severity letter + date, e.g. "I0609 22:57:46...".
+    """
+    head = line[:1]
+    if head in "IWEF" and line[1:5].isdigit():
+        log_func = {"I": logger.info, "W": logger.warning}.get(head, logger.error)
+    else:
+        lowered = line.lstrip().lower()
+        if lowered.startswith(("error", "fatal", "traceback")):
+            log_func = logger.error
+        elif lowered.startswith("warn"):
+            log_func = logger.warning
+        else:
+            log_func = logger.info
+    log_func(line)
+
+
 def run_command(command, log_info_output=True, kill_check=None, check_interval=60.0, pipe_stderr=True, pipe_stdout=True):
     """
     Runs a shell command and checks for errors.
@@ -53,8 +74,8 @@ def run_command(command, log_info_output=True, kill_check=None, check_interval=6
             stdout_thread.start()
         if pipe_stderr:
             stderr_thread = threading.Thread(
-                target=_stream_output, 
-                args=(process.stderr, logger.error)
+                target=_stream_output,
+                args=(process.stderr, _log_stderr_line)
             )
             stderr_thread.daemon = True
             stderr_thread.start()
