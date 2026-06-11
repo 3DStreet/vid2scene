@@ -12,10 +12,11 @@ pitch. Cropping pinhole views directly from the fisheye sources keeps native
 sensor pixels everywhere, and the default view grid points views down past the
 nadir, so the ground is covered by up to 6 views per frame pair instead of 0.
 
-The lens model is an idealized equidistant fisheye by default (see
-fisheye_projection.FisheyeLensModel); per-unit calibration can be supplied as
-a JSON file. Factory calibration / IMU parsing from the .insv trailer is a
-follow-up (see docs/insv_fisheye.md).
+Lens intrinsics come from Insta360's per-unit factory calibration when it can
+be parsed out of the recording (insv_calibration.py: the trailer's offset_v3
+or the .insv.pb sidecar, both MEI camera models). An explicit calibration
+JSON (--insv_calibration) overrides it; with neither, an idealized
+equidistant fisheye is assumed (see docs/insv_fisheye.md).
 """
 
 import argparse
@@ -33,19 +34,21 @@ from typing import cast
 import cv2
 import numpy as np
 import numpy.typing as npt
-from scipy.spatial.transform import Rotation
 from tqdm import tqdm
 
 import pycolmap
 
+import insv_calibration
 import insv_extract
 import pano_sfm
 from fisheye_projection import (
     FisheyeLensModel,
     FisheyeRigRenderOptions,
+    MeiLensModel,
     build_remap_grid,
     closest_view_partition,
     derive_crop_size,
+    get_lens_from_rig_rotations,
     get_lens_local_rotations,
     pinhole_camera_rays,
     pinhole_focal,
@@ -54,22 +57,6 @@ from fisheye_projection import (
 logger = logging.getLogger(__name__)
 
 INSV_RENDER_OPTIONS = FisheyeRigRenderOptions()
-
-
-def get_lens_from_rig_rotations(
-    lens1_yaw_deg: float = 180.0, lens1_roll_deg: float = 0.0
-) -> list[npt.NDArray[np.floating]]:
-    """lens_from_rig rotations for the two back-to-back lenses.
-
-    Lens 0 defines the rig frame; lens 1 nominally points the opposite way
-    (180 degree yaw). The optional roll accounts for sensors mounted rotated
-    relative to each other.
-    """
-    lens0_from_rig = np.eye(3)
-    lens1_from_rig = Rotation.from_euler(
-        "ZY", [lens1_roll_deg, lens1_yaw_deg], degrees=True
-    ).as_matrix()
-    return [lens0_from_rig, lens1_from_rig]
 
 
 def create_fisheye_rig_config(
@@ -116,6 +103,7 @@ class FisheyeFrameProcessor:
         lens_model_overrides: Sequence[dict] | None = None,
         lens1_yaw_deg: float = 180.0,
         lens1_roll_deg: float = 0.0,
+        factory_lenses: Sequence[dict] | None = None,
     ):
         self.lens_frame_dirs = [Path(d) for d in lens_frame_dirs]
         self.output_image_dir = Path(output_image_dir)
@@ -123,15 +111,27 @@ class FisheyeFrameProcessor:
         self.mask_dir = Path(mask_dir) if mask_dir else None
         self.training_mask_dir = Path(training_mask_dir) if training_mask_dir else None
         self.lens_model_overrides = list(lens_model_overrides or [{}, {}])
+        self.factory_lenses = list(factory_lenses) if factory_lenses else None
 
         num_lenses = len(self.lens_frame_dirs)
         if num_lenses != 2:
             raise ValueError(f"Expected 2 lens directories, got {num_lenses}")
 
+        mount_corrections = None
+        if self.factory_lenses:
+            mount_corrections = insv_calibration.get_mount_corrections(self.factory_lenses)
+            logger.info(
+                "Factory lens mounting corrections (yaw, pitch, roll deg): "
+                + ", ".join(f"lens{i}=({y:.3f}, {p:.3f}, {r:.3f})"
+                            for i, (y, p, r) in enumerate(mount_corrections))
+            )
+
         self.cams_from_lens = get_lens_local_rotations(
             render_options.yaws_deg, render_options.pitches_deg
         )
-        self.lens_from_rig = get_lens_from_rig_rotations(lens1_yaw_deg, lens1_roll_deg)
+        self.lens_from_rig = get_lens_from_rig_rotations(
+            lens1_yaw_deg, lens1_roll_deg, mount_corrections
+        )
 
         # One virtual view per (lens, lens-local rotation)
         self.view_lens_idx: list[int] = []
@@ -152,7 +152,7 @@ class FisheyeFrameProcessor:
         self._lock = Lock()
         self._initialized = False
         self._camera: pycolmap.Camera | None = None
-        self.lens_models: list[FisheyeLensModel] | None = None
+        self.lens_models: list[FisheyeLensModel | MeiLensModel] | None = None
         self.crop_size: int | None = None
         self._maps: list[tuple[np.ndarray, np.ndarray]] = []
         self._sfm_mask_png: list[bytes] = []
@@ -163,11 +163,22 @@ class FisheyeFrameProcessor:
         self.lens_models = []
         for lens_idx, image in enumerate(lens_images):
             height, width = image.shape[:2]
-            overrides = dict(self.lens_model_overrides[lens_idx])
-            self.lens_models.append(FisheyeLensModel(width=width, height=height, **overrides))
+            if self.factory_lenses:
+                kwargs = insv_calibration.mei_model_kwargs_for_stream(
+                    self.factory_lenses[lens_idx], width, height
+                )
+                model = MeiLensModel(width=width, height=height, **kwargs)
+                logger.info(
+                    f"Lens {lens_idx}: factory MEI calibration, xi={model.xi:.3f}, "
+                    f"f=({model.fx:.1f}, {model.fy:.1f}), c=({model.cx:.1f}, {model.cy:.1f})"
+                )
+            else:
+                overrides = dict(self.lens_model_overrides[lens_idx])
+                model = FisheyeLensModel(width=width, height=height, **overrides)
+            self.lens_models.append(model)
             logger.info(
-                f"Lens {lens_idx}: {width}x{height}, fov={self.lens_models[lens_idx].fov_deg} deg, "
-                f"focal={self.lens_models[lens_idx].focal_px_per_rad:.1f} px/rad"
+                f"Lens {lens_idx}: {width}x{height}, fov={model.fov_deg} deg, "
+                f"focal={model.focal_px_per_rad:.1f} px/rad"
             )
 
         options = self.render_options
@@ -337,6 +348,7 @@ def run_insv_sfm(
     render_options: FisheyeRigRenderOptions = INSV_RENDER_OPTIONS,
     lens_fov_deg: float | None = None,
     calibration_path=None,
+    use_factory_calibration: bool = True,
     kill_check=None,
 ) -> Path | None:
     """
@@ -355,7 +367,9 @@ def run_insv_sfm(
         generate_masks: Generate feature-extraction masks (validity + view partition)
         render_options: Virtual view layout configuration
         lens_fov_deg: Override the assumed lens FOV (default 200)
-        calibration_path: Optional lens calibration JSON
+        calibration_path: Optional lens calibration JSON (overrides factory)
+        use_factory_calibration: Use Insta360's per-unit factory calibration
+            when it can be parsed from the recording (default True)
         kill_check: Optional callback to check if processing should abort
 
     Returns:
@@ -372,9 +386,8 @@ def run_insv_sfm(
     if training_mask_dir:
         training_mask_dir.mkdir(exist_ok=True, parents=True)
 
-    metadata = insv_extract.summarize_insv_metadata(
-        insv_extract.read_insv_trailer_records(insv_path)
-    )
+    trailer_records = insv_extract.read_insv_trailer_records(insv_path)
+    metadata = insv_extract.summarize_insv_metadata(trailer_records)
     if metadata.get("record_ids"):
         logger.info(f".insv trailer records: {metadata['record_ids']}")
     if metadata.get("file_info_strings"):
@@ -384,6 +397,27 @@ def run_insv_sfm(
     lens_model_overrides = build_lens_model_overrides(calibration, lens_fov_deg)
     lens1_yaw_deg = (calibration or {}).get("lens1_yaw_deg", 180.0)
     lens1_roll_deg = (calibration or {}).get("lens1_roll_deg", 0.0)
+
+    factory_lenses = None
+    if calibration is not None:
+        logger.info("Explicit calibration JSON provided; factory calibration not used")
+    elif use_factory_calibration:
+        factory = insv_calibration.load_factory_calibration(insv_path, trailer_records)
+        if factory:
+            factory_lenses = factory["lenses"]
+            if lens_fov_deg is not None:
+                for lens_spec in factory_lenses:
+                    lens_spec["fov_deg"] = lens_fov_deg
+            camera = factory.get("camera_type") or "unknown camera"
+            logger.info(
+                f"Using Insta360 factory lens calibration for {camera} "
+                f"from {factory['source']}"
+            )
+        else:
+            logger.info(
+                "No factory lens calibration found in the recording; "
+                "using the idealized lens model (see docs/insv_fisheye.md)"
+            )
 
     if kill_check and kill_check():
         logger.info("Job cancelled before .insv extraction")
@@ -417,6 +451,7 @@ def run_insv_sfm(
             lens_model_overrides=lens_model_overrides,
             lens1_yaw_deg=lens1_yaw_deg,
             lens1_roll_deg=lens1_roll_deg,
+            factory_lenses=factory_lenses,
         )
         render_fisheye_views(processor, frame_names)
     finally:
@@ -452,7 +487,10 @@ if __name__ == "__main__":
     parser.add_argument("--lens_fov", type=float, default=None,
                         help="Assumed full lens FOV in degrees (default 200)")
     parser.add_argument("--calibration", type=Path, default=None,
-                        help="Optional lens calibration JSON")
+                        help="Optional lens calibration JSON (overrides factory calibration)")
+    parser.add_argument("--no_factory_calibration", action="store_true",
+                        help="Ignore Insta360's factory lens calibration and use the "
+                             "idealized lens model")
 
     args = parser.parse_args()
 
@@ -463,6 +501,7 @@ if __name__ == "__main__":
         mapper=args.mapper,
         lens_fov_deg=args.lens_fov,
         calibration_path=args.calibration,
+        use_factory_calibration=not args.no_factory_calibration,
     )
 
     if result:

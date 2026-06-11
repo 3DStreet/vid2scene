@@ -4,6 +4,7 @@ import pytest
 
 from fisheye_projection import (
     FisheyeLensModel,
+    MeiLensModel,
     build_remap_grid,
     closest_view_partition,
     derive_crop_size,
@@ -75,6 +76,83 @@ class TestFisheyeLensModel:
         np.testing.assert_allclose(
             model.focal_px_per_rad, 1440.0 / np.deg2rad(100.0)
         )
+
+
+def make_mei_model(**kwargs) -> MeiLensModel:
+    defaults = dict(
+        width=3840, height=3840, xi=2.0,
+        fx=3087.0, fy=3087.0, cx=1920.0, cy=1920.0,
+    )
+    defaults.update(kwargs)
+    return MeiLensModel(**defaults)
+
+
+class TestMeiLensModel:
+    def test_center_ray_projects_to_principal_point(self):
+        model = make_mei_model()
+        uv, valid = model.project_rays(np.array([[0.0, 0.0, 1.0]]))
+        assert valid[0]
+        np.testing.assert_allclose(uv[0], [1920.0, 1920.0], atol=1e-9)
+
+    def test_undistorted_radius_matches_unified_sphere_formula(self):
+        # r = fx * sin(theta) / (cos(theta) + xi) without distortion terms
+        model = make_mei_model()
+        for theta_deg in (10.0, 45.0, 90.0):
+            theta = np.deg2rad(theta_deg)
+            uv, valid = model.project_rays(
+                np.array([[np.sin(theta), 0.0, np.cos(theta)]])
+            )
+            assert valid[0]
+            expected = model.fx * np.sin(theta) / (np.cos(theta) + model.xi)
+            np.testing.assert_allclose(uv[0], [model.cx + expected, model.cy], atol=1e-9)
+
+    def test_focal_px_per_rad_matches_small_angle_slope(self):
+        model = make_mei_model()
+        theta = 1e-6
+        uv, _ = model.project_rays(np.array([[np.sin(theta), 0.0, np.cos(theta)]]))
+        slope = (uv[0, 0] - model.cx) / theta
+        np.testing.assert_allclose(model.focal_px_per_rad, slope, rtol=1e-6)
+        np.testing.assert_allclose(model.focal_px_per_rad, model.fx / (1.0 + model.xi))
+
+    def test_radial_distortion_is_applied(self):
+        theta = np.deg2rad(60.0)
+        ray = np.array([[np.sin(theta), 0.0, np.cos(theta)]])
+        plain, _ = make_mei_model().project_rays(ray)
+        distorted, _ = make_mei_model(k1=0.22).project_rays(ray)
+        m = np.sin(theta) / (np.cos(theta) + 2.0)
+        expected_shift = 3087.0 * 0.22 * m**3
+        np.testing.assert_allclose(
+            distorted[0, 0] - plain[0, 0], expected_shift, rtol=1e-9
+        )
+
+    def test_rays_beyond_fov_are_invalid(self):
+        # With xi >= 1 the projection accepts almost any direction, so the
+        # FOV cone must bound validity.
+        model = make_mei_model(fov_deg=200.0)
+        theta = np.deg2rad(105.0)
+        _, valid = model.project_rays(np.array([[np.sin(theta), 0.0, np.cos(theta)]]))
+        assert not valid[0]
+        theta = np.deg2rad(95.0)
+        _, valid = model.project_rays(np.array([[np.sin(theta), 0.0, np.cos(theta)]]))
+        assert valid[0]
+
+    def test_unnormalized_rays_project_identically(self):
+        model = make_mei_model()
+        ray = np.array([[0.3, -0.2, 0.9]])
+        uv1, _ = model.project_rays(ray)
+        uv2, _ = model.project_rays(ray * 7.5)
+        np.testing.assert_allclose(uv1, uv2, atol=1e-9)
+
+    def test_works_with_remap_grid_and_crop_size(self):
+        model = make_mei_model()
+        size = derive_crop_size(model, 75.0, max_crop_size=1600)
+        assert size % 2 == 0 and size >= 256
+        map_x, map_y, valid = build_remap_grid(model, np.eye(3), 75.0, 64)
+        assert valid.all()
+        center = np.array(
+            [map_x[31:33, 31:33].mean(), map_y[31:33, 31:33].mean()]
+        )
+        np.testing.assert_allclose(center, [model.cx - 0.5, model.cy - 0.5], atol=1.0)
 
 
 class TestPinholeRays:

@@ -93,8 +93,15 @@ def parse_arguments():
     parser.add_argument(
         "--insv_calibration",
         help="Path to a lens calibration JSON for --insv_fisheye "
-             "(see docs/insv_fisheye.md).",
+             "(overrides the factory calibration; see docs/insv_fisheye.md).",
         default=None,
+    )
+    parser.add_argument(
+        "--insv_no_factory_calibration",
+        help="Ignore Insta360's per-unit factory lens calibration embedded in "
+             "the .insv recording and use the idealized lens model instead.",
+        action="store_true",
+        default=False,
     )
     parser.add_argument(
         "--use_background_sphere",
@@ -508,6 +515,7 @@ def process_video_to_scene(
     insv_fisheye=False,
     insv_lens_fov=None,
     insv_calibration=None,
+    insv_no_factory_calibration=False,
     use_background_sphere=False,
     apply_pilgram_filter_name=None,
     training_max_num_gaussians=1_000_000,
@@ -538,7 +546,10 @@ def process_video_to_scene(
             fisheye streams (skips the equirectangular intermediate). Enabled
             automatically when video_path ends in .insv.
         insv_lens_fov: Assumed full fisheye lens FOV in degrees (default 200)
-        insv_calibration: Path to a lens calibration JSON (see docs/insv_fisheye.md)
+        insv_calibration: Path to a lens calibration JSON, overriding the factory
+            calibration (see docs/insv_fisheye.md)
+        insv_no_factory_calibration: Ignore the per-unit factory calibration
+            embedded in the recording and use the idealized lens model
         use_background_sphere: Whether to use a background sphere
         apply_pilgram_filter_name: Name of Pilgram filter to apply (if any)
         training_max_num_gaussians: Maximum number of Gaussians to use in Gsplat
@@ -620,6 +631,7 @@ def process_video_to_scene(
                 generate_masks=True,
                 lens_fov_deg=insv_lens_fov,
                 calibration_path=insv_calibration,
+                use_factory_calibration=not insv_no_factory_calibration,
                 kill_check=kill_check,
             )
 
@@ -844,6 +856,7 @@ if __name__ == "__main__":
         insv_fisheye=args.insv_fisheye,
         insv_lens_fov=args.insv_lens_fov,
         insv_calibration=args.insv_calibration,
+        insv_no_factory_calibration=args.insv_no_factory_calibration,
         use_background_sphere=args.use_background_sphere,
         apply_pilgram_filter_name=args.apply_pilgram_filter,
         training_max_num_gaussians=args.training_max_num_gaussians,

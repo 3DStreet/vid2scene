@@ -120,6 +120,98 @@ class FisheyeLensModel:
 
 
 @dataclass
+class MeiLensModel:
+    """Unified omnidirectional (MEI/UCM) camera model with extended distortion.
+
+    This is the model Insta360 uses for its per-unit factory calibration
+    (parsed from the .insv trailer / .pb sidecar by insv_calibration.py). A
+    ray is normalized onto the unit sphere, perspective-projected from a
+    point ``xi`` above the sphere center onto the normalized plane
+    ``m = (x, y) / (z + xi)``, distorted with radial (k1..k4 on r^2..r^8),
+    tangential (p1, p2) and thin-prism (s1..s4) terms, and scaled by the
+    pinhole-like intrinsics fx/fy/cx/cy.
+
+    All parameters are expected in actual stream resolution and COLMAP pixel
+    convention (top-left pixel center at (0.5, 0.5)). ``fov_deg`` bounds the
+    valid cone: with xi >= 1 the projection itself accepts rays from (nearly)
+    every direction, so validity must come from the known lens coverage.
+    """
+
+    width: int
+    height: int
+    xi: float
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    k1: float = 0.0
+    k2: float = 0.0
+    k3: float = 0.0
+    k4: float = 0.0
+    p1: float = 0.0
+    p2: float = 0.0
+    s1: float = 0.0
+    s2: float = 0.0
+    s3: float = 0.0
+    s4: float = 0.0
+    fov_deg: float = 200.0
+
+    @property
+    def focal_px_per_rad(self) -> float:
+        """Angular resolution at the image center, for crop-size derivation.
+
+        Near the optical axis r = fx * sin(theta) / (cos(theta) + xi)
+        ~= fx * theta / (1 + xi).
+        """
+        return self.fx / (1.0 + self.xi)
+
+    def project_rays(
+        self, rays: npt.NDArray[np.floating]
+    ) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.bool_]]:
+        """Project rays (N, 3) in the lens frame to pixel coordinates.
+
+        Same interface as FisheyeLensModel.project_rays: returns (uv, valid)
+        with uv in COLMAP pixel convention and valid marking rays inside the
+        lens FOV cone and the image bounds.
+        """
+        rays = np.asarray(rays, dtype=np.float64)
+        norm = np.linalg.norm(rays, axis=-1)
+        norm = np.maximum(norm, 1e-12)
+        x, y, z = np.moveaxis(rays, -1, 0) / norm
+
+        denom = z + self.xi
+        theta = np.arctan2(np.hypot(x, y), z)
+        valid = (denom > 1e-6) & (theta <= np.deg2rad(self.fov_deg / 2))
+
+        safe_denom = np.where(valid, denom, 1.0)
+        mx = x / safe_denom
+        my = y / safe_denom
+
+        r2 = mx * mx + my * my
+        r4 = r2 * r2
+        radial = 1.0 + self.k1 * r2 + self.k2 * r4 + self.k3 * r2 * r4 + self.k4 * r4 * r4
+        xd = (
+            mx * radial
+            + 2 * self.p1 * mx * my
+            + self.p2 * (r2 + 2 * mx * mx)
+            + self.s1 * r2
+            + self.s2 * r4
+        )
+        yd = (
+            my * radial
+            + self.p1 * (r2 + 2 * my * my)
+            + 2 * self.p2 * mx * my
+            + self.s3 * r2
+            + self.s4 * r4
+        )
+
+        u = self.fx * xd + self.cx
+        v = self.fy * yd + self.cy
+        valid &= (u >= 0.0) & (u <= self.width) & (v >= 0.0) & (v <= self.height)
+        return np.stack([u, v], axis=-1), valid
+
+
+@dataclass
 class FisheyeRigRenderOptions:
     """Virtual pinhole view layout rendered from each fisheye lens.
 
@@ -175,6 +267,35 @@ def get_lens_local_rotations(
                 Rotation.from_euler("XY", [-pitch_deg, -yaw_deg], degrees=True).as_matrix()
             )
     return rotations
+
+
+def get_lens_from_rig_rotations(
+    lens1_yaw_deg: float = 180.0,
+    lens1_roll_deg: float = 0.0,
+    mount_corrections: Sequence[tuple[float, float, float]] | None = None,
+) -> list[npt.NDArray[np.floating]]:
+    """lens_from_rig rotations for the two back-to-back lenses.
+
+    Lens 0 defines the rig frame; lens 1 nominally points the opposite way
+    (180 degree yaw). The optional roll accounts for sensors mounted rotated
+    relative to each other. mount_corrections are per-lens factory-measured
+    (yaw, pitch, roll) deviations in degrees, applied in each lens' local
+    frame on top of its nominal orientation (matching how insv-stitch
+    composes the Insta360 factory extrinsics).
+    """
+    corrections = mount_corrections or ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+    # Column-vector lens->rig corrections; transposed below into this file's
+    # row-vector convention (ray_in_rig = ray_in_lens @ lens_from_rig).
+    correction_cols = [
+        Rotation.from_euler("YXZ", list(correction), degrees=True).as_matrix()
+        for correction in corrections
+    ]
+    lens1_base = Rotation.from_euler(
+        "ZY", [lens1_roll_deg, lens1_yaw_deg], degrees=True
+    ).as_matrix()
+    lens0_from_rig = correction_cols[0].T
+    lens1_from_rig = correction_cols[1].T @ lens1_base
+    return [lens0_from_rig, lens1_from_rig]
 
 
 def derive_crop_size(lens_model: FisheyeLensModel, crop_fov_deg: float, max_crop_size: int) -> int:

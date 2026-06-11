@@ -56,12 +56,52 @@ Supported `.insv` layouts (demuxed with ffmpeg):
 
 ## Lens model and calibration
 
-By default each lens is modeled as an idealized equidistant fisheye:
-principal point at the frame center, image circle inscribed in the frame,
-and a nominal 200° FOV mapped linearly onto the circle
-(`fisheye_projection.FisheyeLensModel`). Real lenses deviate; if the
-reconstruction shows systematic warp, supply a calibration JSON via
-`--insv_calibration`:
+Lens intrinsics are resolved in this order:
+
+1. **Explicit calibration JSON** (`--insv_calibration`, schema below) —
+   always wins when provided.
+2. **Insta360's per-unit factory calibration**, parsed from the recording
+   itself (`insv_calibration.py`). Disable with
+   `--insv_no_factory_calibration`.
+3. **Idealized equidistant fisheye**: principal point at the frame center,
+   image circle inscribed in the frame, and a nominal 200° FOV mapped
+   linearly onto the circle (`fisheye_projection.FisheyeLensModel`).
+
+### Factory calibration
+
+Every Insta360 camera is calibrated at the factory and embeds the result in
+each recording as an MEI (unified omnidirectional) camera model — the same
+model `cv2.omnidir` uses: unit-sphere projection with mirror parameter `xi`,
+pinhole-like `fx/fy/cx/cy`, radial `k1..k4`, tangential `p1/p2` and
+thin-prism `s1..s4` distortion (`fisheye_projection.MeiLensModel`). It is
+read from two places, in order of preference:
+
+- the **`.insv.pb` sidecar** (X5; `MISC/Camera01/<name>.insv.pb` on the SD
+  card, or next to the video) — 27 fields per lens including k4 and
+  thin-prism terms;
+- the **trailer's `offset_v3` string** (protobuf metadata record of the
+  `.insv` itself) — 20 fields per lens.
+
+Field layouts follow [telemetry-parser](https://github.com/AdrianEddy/telemetry-parser)
+(`src/insta360/extra_info.rs`, `mod.rs`) and
+[insv-stitch](https://github.com/BenjaminHenriksson/insv-stitch), which
+validated the `.pb` interpretation against in-camera stitching. The factory
+values also provide per-lens mounting corrections (sub-degree yaw/pitch/roll
+deviations from the nominal back-to-back geometry), which are applied to the
+rig configuration.
+
+Calibration values are stored at a per-model reference resolution (5376 px
+per lens on the X5, 8000×6000 on the X4) and are rescaled to the demuxed
+stream resolution using the `window_crop_info` metadata when present, or a
+centered aspect-fit otherwise. Pending validation on real footage: the
+scaling rule for models other than X4/X5, and the sign convention of the
+mounting corrections (sub-degree, so low risk). Parsing is best-effort —
+any failure falls back to the idealized model with a log line.
+
+### Calibration JSON
+
+If the reconstruction shows systematic warp (or to override the factory
+values), supply a calibration JSON via `--insv_calibration`:
 
 ```json
 {
@@ -96,22 +136,25 @@ For every rendered view two masks are produced:
 
 ## Current limitations / follow-ups
 
-- **No per-unit factory calibration.** Insta360 ships MEI-model calibration
-  (protobuf, in the trailer or an `.insv.pb` sidecar on X5); parsing it
-  would remove the idealized-lens assumption. The
-  [telemetry-parser](https://github.com/AdrianEddy/telemetry-parser) crate
-  (used by [insv-stitch](https://github.com/BenjaminHenriksson/insv-stitch))
-  already reads these.
+- **Factory calibration not yet validated on real footage.** The parsing is
+  exercised against synthetic data matching community-documented layouts;
+  real X4/X5 recordings should confirm the reference-resolution scaling and
+  the mounting-correction signs. `--insv_no_factory_calibration` provides
+  an immediate fallback for A/B comparison.
 - **No IMU use.** The trailer's gyro record (`0x300`) could provide
   horizon leveling and rolling-shutter correction.
 - **Lens baseline ignored.** The two lens centers are ~2–3 cm apart but the
   rig assumes a shared center, like the ER path (and Insta360's own
-  stitching). Only matters for subjects very close to the camera.
+  stitching). The factory calibration's per-lens translation is parsed but
+  not applied (observed as zeros in community dumps; using a metric value
+  would also pin the reconstruction scale, which needs deliberate handling).
+  Only matters for subjects very close to the camera.
 - **No ego-object masking.** The ER path can mask the operator/tripod with
   SAM3; that step is not yet wired into the fisheye path.
 - **Trailer parsing is best-effort.** Based on community reverse
-  engineering (ExifTool, Sub-Etha Software); used only for logging camera
-  metadata. Failures are silent and harmless.
+  engineering (ExifTool, Sub-Etha Software, telemetry-parser); used for
+  factory calibration and camera-metadata logging. Failures degrade to the
+  idealized lens model.
 - **Server/API wiring.** The web upload flow only exposes the
   `equirectangular` flag; `.insv` uploads through the server need a model
   field + form pass-through (auto-detection by extension already works at
