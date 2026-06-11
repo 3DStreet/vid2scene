@@ -7,6 +7,7 @@ import logging
 import tempfile
 import equirectangular_to_perspective
 import pano_sfm
+import fisheye_sfm
 from create_background_sphere import add_background_sphere
 from run_command import run_command
 from preview_data_handler import PreviewDataHandler
@@ -71,6 +72,34 @@ def parse_arguments():
     parser.add_argument(
         "--equirectangular",
         help="Use equirectangular/360 video input. Uses rig-based SfM for better results.",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--insv_fisheye",
+        help="Process an Insta360 .insv recording directly from its dual fisheye "
+             "streams (skips the equirectangular intermediate; better ground/sky "
+             "detail). Enabled automatically when video_path ends in .insv.",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--insv_lens_fov",
+        type=float,
+        help="Assumed full FOV of each fisheye lens in degrees for --insv_fisheye "
+             "(default 200).",
+        default=None,
+    )
+    parser.add_argument(
+        "--insv_calibration",
+        help="Path to a lens calibration JSON for --insv_fisheye "
+             "(overrides the factory calibration; see docs/insv_fisheye.md).",
+        default=None,
+    )
+    parser.add_argument(
+        "--insv_no_factory_calibration",
+        help="Ignore Insta360's per-unit factory lens calibration embedded in "
+             "the .insv recording and use the idealized lens model instead.",
         action="store_true",
         default=False,
     )
@@ -483,6 +512,10 @@ def process_video_to_scene(
     preview_data_handler=None,
     remove_background_from_images=False,
     equirectangular=False,
+    insv_fisheye=False,
+    insv_lens_fov=None,
+    insv_calibration=None,
+    insv_no_factory_calibration=False,
     use_background_sphere=False,
     apply_pilgram_filter_name=None,
     training_max_num_gaussians=1_000_000,
@@ -509,6 +542,14 @@ def process_video_to_scene(
         remove_background_from_images: Whether to remove backgrounds from images
         kill_check: Function that returns True if processing should be terminated
         equirectangular: Whether to use equirectangular/360 video input (uses rig-based SfM)
+        insv_fisheye: Process an Insta360 .insv recording directly from its dual
+            fisheye streams (skips the equirectangular intermediate). Enabled
+            automatically when video_path ends in .insv.
+        insv_lens_fov: Assumed full fisheye lens FOV in degrees (default 200)
+        insv_calibration: Path to a lens calibration JSON, overriding the factory
+            calibration (see docs/insv_fisheye.md)
+        insv_no_factory_calibration: Ignore the per-unit factory calibration
+            embedded in the recording and use the idealized lens model
         use_background_sphere: Whether to use a background sphere
         apply_pilgram_filter_name: Name of Pilgram filter to apply (if any)
         training_max_num_gaussians: Maximum number of Gaussians to use in Gsplat
@@ -552,9 +593,62 @@ def process_video_to_scene(
         logger.info("Job was deleted before processing started, stopping")
         return None
 
+    # Raw .insv recordings carry two fisheye streams; process them directly
+    # unless the caller explicitly asked for the equirectangular path.
+    if (
+        video_path
+        and str(video_path).lower().endswith(".insv")
+        and not insv_fisheye
+        and not equirectangular
+    ):
+        logger.info("Detected .insv input, enabling direct dual-fisheye processing")
+        insv_fisheye = True
 
     if not sfm_dir:
-        if equirectangular:
+        if insv_fisheye:
+            from pathlib import Path
+            if not video_path:
+                raise ValueError("insv_fisheye requires video_path pointing at an .insv recording")
+            render_options = fisheye_sfm.INSV_RENDER_OPTIONS
+            views_per_frame = 2 * render_options.num_views_per_lens
+
+            # Match the equirectangular path's total image budget: target
+            # frames are bumped to at least 800 and each frame pair fans out
+            # into views_per_frame perspective images.
+            insv_target = max(target_framecount, 800)
+            frame_pair_count = max(3, int(insv_target / (views_per_frame / 2)))
+            logger.info(
+                f".insv video: extracting {frame_pair_count} fisheye frame pairs x "
+                f"{views_per_frame} virtual cameras = {frame_pair_count * views_per_frame} total images"
+            )
+
+            logger.info("Running direct dual-fisheye SfM pipeline with rig constraints")
+            sparse_result = fisheye_sfm.run_insv_sfm(
+                insv_path=video_path,
+                output_path=Path(sfm_output_dir),
+                target_framecount=frame_pair_count,
+                mapper="colmap",  # COLMAP incremental mapper (more stable with pycolmap rig config)
+                generate_masks=True,
+                lens_fov_deg=insv_lens_fov,
+                calibration_path=insv_calibration,
+                use_factory_calibration=not insv_no_factory_calibration,
+                kill_check=kill_check,
+            )
+
+            if sparse_result is None:
+                logger.error("Direct dual-fisheye SfM pipeline failed or was cancelled")
+                return None
+
+            # Select the best sparse subdirectory (largest points3D.bin) for gsplat
+            select_best_sparse_subdir(sfm_output_dir)
+
+            # Run orientation alignment to fix up direction
+            align_sfm_orientation(sfm_output_dir, kill_check=kill_check)
+
+            # Update images_output_dir to point to rendered perspectives
+            images_output_dir = os.path.join(sfm_output_dir, "images")
+            logger.info(f"Dual-fisheye SfM completed, perspectives in {images_output_dir}")
+        elif equirectangular:
             # Use new pano_sfm pipeline for 360 content
             from pathlib import Path
             render_options = pano_sfm.PANO_RENDER_OPTIONS
@@ -759,6 +853,10 @@ if __name__ == "__main__":
         preview_data_handler=None,
         remove_background_from_images=args.remove_background,
         equirectangular=args.equirectangular,
+        insv_fisheye=args.insv_fisheye,
+        insv_lens_fov=args.insv_lens_fov,
+        insv_calibration=args.insv_calibration,
+        insv_no_factory_calibration=args.insv_no_factory_calibration,
         use_background_sphere=args.use_background_sphere,
         apply_pilgram_filter_name=args.apply_pilgram_filter,
         training_max_num_gaussians=args.training_max_num_gaussians,
