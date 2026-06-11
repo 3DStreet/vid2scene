@@ -527,6 +527,151 @@ def render_perspective_images(
     return processor.rig_config
 
 
+def run_rig_sfm_pipeline(
+    output_path: Path,
+    image_dir: Path,
+    rig_config: pycolmap.RigConfig,
+    mask_dir: Path | None = None,
+    mapper: str = "glomap",
+    kill_check=None,
+) -> Path | None:
+    """
+    Run rig-constrained SfM on pre-rendered virtual perspective images.
+
+    This covers feature extraction, rig configuration, sequential matching,
+    and mapping. Shared by the equirectangular pipeline (run_pano_sfm) and
+    the direct dual-fisheye pipeline (fisheye_sfm.run_insv_sfm).
+
+    Args:
+        output_path: Output directory for the database and sparse reconstruction
+        image_dir: Directory containing the rendered perspective images
+        rig_config: Rig configuration describing the virtual camera geometry
+        mask_dir: Optional directory with feature-extraction masks
+        mapper: Reconstruction method ("glomap" for global, "colmap" for incremental)
+        kill_check: Optional callback to check if processing should abort
+
+    Returns:
+        Path to sparse reconstruction directory, or None if aborted/failed
+    """
+    from run_command import run_command
+
+    database_path = output_path / "database.db"
+    sparse_path = output_path / "sparse"
+    sparse_path.mkdir(exist_ok=True, parents=True)
+
+    # Clean up old database if exists
+    if database_path.exists():
+        database_path.unlink()
+
+    # ========== Step 2: Feature extraction ==========
+    logger.info("Extracting features...")
+    reader_options = pycolmap.ImageReaderOptions()
+    if mask_dir and mask_dir.exists():
+        reader_options.mask_path = str(mask_dir)
+
+    # Feature extraction options for denser feature extraction
+    extraction_options = pycolmap.FeatureExtractionOptions()
+    extraction_options.sift.max_num_features = 32768  # Default is 8192, very high for dense points
+    extraction_options.sift.first_octave = -1  # Default is 0, -1 extracts more features at finest scale
+    extraction_options.sift.peak_threshold = 0.003  # Default is 0.0067, lower = more features
+
+    pycolmap.extract_features(
+        str(database_path),
+        str(image_dir),
+        reader_options=reader_options,
+        extraction_options=extraction_options,
+        camera_mode=pycolmap.CameraMode.PER_FOLDER,
+    )
+
+    if kill_check and kill_check():
+        logger.info("Job cancelled after feature extraction")
+        return None
+
+    # ========== Step 3: Apply rig configuration ==========
+    logger.info("Applying rig configuration...")
+    with pycolmap.Database.open(str(database_path)) as db:
+        pycolmap.apply_rig_config([rig_config], db)
+
+    if kill_check and kill_check():
+        logger.info("Job cancelled after applying rig config")
+        return None
+
+    # ========== Step 4: Feature matching with COLMAP sequential matching ==========
+    logger.info("Matching features using sequential strategy...")
+    matching_options = pycolmap.FeatureMatchingOptions()
+    # Note: rig_verification and skip_image_pairs_in_same_frame can cause issues
+    # with some versions of pycolmap/glomap. Disable for now.
+    # matching_options.rig_verification = True
+    # matching_options.skip_image_pairs_in_same_frame = True
+
+    seq_options = pycolmap.SequentialPairingOptions()
+    seq_options.overlap = 30  # Default is ~10, increase for more matches
+    seq_options.loop_detection = False
+    pycolmap.match_sequential(
+        str(database_path),
+        pairing_options=seq_options,
+        matching_options=matching_options,
+    )
+
+    if kill_check and kill_check():
+        logger.info("Job cancelled after matching")
+        return None
+
+    # ========== Step 5: Run reconstruction ==========
+    if mapper == "glomap":
+        # GLOMAP global mapping with rig support
+        logger.info("Running GLOMAP global mapping with rig support...")
+
+        success = run_command([
+            "glomap", "mapper",
+            "--database_path", str(database_path),
+            "--image_path", str(image_dir),
+            "--output_path", str(sparse_path),
+            "--BundleAdjustment.optimize_rig_poses", "1",     # Optimize rig poses
+            "--BundleAdjustment.optimize_intrinsics", "0",    # Don't change virtual cam intrinsics
+            "--skip_view_graph_calibration", "1",             # Trust rig config
+            "--ba_iteration_num", "5",
+            "--skip_pruning", "0",
+        ], kill_check=kill_check)
+
+        if not success:
+            logger.error("GLOMAP mapping failed!")
+            return None
+
+        # Re-register images that may have been pruned
+        zero_dir = sparse_path / "0"
+        if zero_dir.exists():
+            logger.info("Running image registrator to recover pruned images...")
+            run_command([
+                "colmap", "image_registrator",
+                "--database_path", str(database_path),
+                "--input_path", str(zero_dir),
+                "--output_path", str(zero_dir),
+            ], kill_check=kill_check)
+    else:
+        # COLMAP incremental mapping with fixed rig poses
+        logger.info("Running COLMAP incremental mapping with rig constraints...")
+        opts = pycolmap.IncrementalPipelineOptions(
+            ba_refine_sensor_from_rig=False,  # Don't modify rig relative poses
+            ba_refine_focal_length=False,     # Virtual cams have perfect intrinsics
+            ba_refine_principal_point=False,
+            ba_refine_extra_params=False,
+        )
+
+        recs = pycolmap.incremental_mapping(
+            str(database_path), str(image_dir), str(sparse_path), opts
+        )
+
+        for idx, rec in recs.items():
+            logger.info(f"Reconstruction #{idx}: {rec.summary()}")
+
+        if not recs:
+            logger.error("No reconstructions created!")
+            return None
+
+    return sparse_path
+
+
 def run_pano_sfm(
     input_image_path: Path,
     output_path: Path,
@@ -537,7 +682,7 @@ def run_pano_sfm(
 ) -> Path | None:
     """
     Run the full panorama SfM pipeline.
-    
+
     This function:
     1. (Optional) Detects static objects like tripods using temporal variance
     2. Renders perspective images from equirectangular panoramas
@@ -545,7 +690,7 @@ def run_pano_sfm(
     4. Applies rig configuration for multi-camera constraint
     5. Matches features with COLMAP sequential matching
     6. Runs reconstruction using GLOMAP (global) or COLMAP (incremental)
-    
+
     Args:
         input_image_path: Directory containing equirectangular panorama images
         output_path: Output directory for rendered images and SfM results
@@ -553,29 +698,19 @@ def run_pano_sfm(
         generate_masks: Whether to generate per-pixel masks for feature extraction
         detect_static: Whether to detect and mask static objects (tripod, car hood)
         kill_check: Optional callback to check if processing should abort
-        
+
     Returns:
         Path to sparse reconstruction directory, or None if aborted/failed
     """
-    from run_command import run_command
-    
     pycolmap.set_random_seed(0)
     render_options = PANO_RENDER_OPTIONS
-    
+
     # Setup directories
     image_dir = output_path / "images"
     mask_dir = output_path / "masks" if generate_masks else None
-    database_path = output_path / "database.db"
-    sparse_path = output_path / "sparse"
-    
     image_dir.mkdir(exist_ok=True, parents=True)
-    sparse_path.mkdir(exist_ok=True, parents=True)
     if mask_dir:
         mask_dir.mkdir(exist_ok=True, parents=True)
-    
-    # Clean up old database if exists
-    if database_path.exists():
-        database_path.unlink()
 
     # Find input panoramas
     pano_image_names = sorted(
@@ -629,113 +764,15 @@ def run_pano_sfm(
         logger.info("Job cancelled after rendering")
         return None
 
-    # ========== Step 2: Feature extraction ==========
-    logger.info("Extracting features...")
-    reader_options = pycolmap.ImageReaderOptions()
-    if mask_dir and mask_dir.exists():
-        reader_options.mask_path = str(mask_dir)
-    
-    # Feature extraction options for denser feature extraction
-    extraction_options = pycolmap.FeatureExtractionOptions()
-    extraction_options.sift.max_num_features = 32768  # Default is 8192, very high for dense points
-    extraction_options.sift.first_octave = -1  # Default is 0, -1 extracts more features at finest scale
-    extraction_options.sift.peak_threshold = 0.003  # Default is 0.0067, lower = more features
-    
-    pycolmap.extract_features(
-        str(database_path),
-        str(image_dir),
-        reader_options=reader_options,
-        extraction_options=extraction_options,
-        camera_mode=pycolmap.CameraMode.PER_FOLDER,
+    # ========== Steps 2-5: Features, rig config, matching, mapping ==========
+    return run_rig_sfm_pipeline(
+        output_path=output_path,
+        image_dir=image_dir,
+        rig_config=rig_config,
+        mask_dir=mask_dir,
+        mapper=mapper,
+        kill_check=kill_check,
     )
-
-    if kill_check and kill_check():
-        logger.info("Job cancelled after feature extraction")
-        return None
-
-    # ========== Step 3: Apply rig configuration ==========
-    logger.info("Applying rig configuration...")
-    with pycolmap.Database.open(str(database_path)) as db:
-        pycolmap.apply_rig_config([rig_config], db)
-
-    if kill_check and kill_check():
-        logger.info("Job cancelled after applying rig config")
-        return None
-
-    # ========== Step 4: Feature matching with COLMAP sequential matching ==========
-    logger.info("Matching features using sequential strategy...")
-    matching_options = pycolmap.FeatureMatchingOptions()
-    # Note: rig_verification and skip_image_pairs_in_same_frame can cause issues
-    # with some versions of pycolmap/glomap. Disable for now.
-    # matching_options.rig_verification = True
-    # matching_options.skip_image_pairs_in_same_frame = True
-    
-    seq_options = pycolmap.SequentialPairingOptions()
-    seq_options.overlap = 30  # Default is ~10, increase for more matches
-    seq_options.loop_detection = False
-    pycolmap.match_sequential(
-        str(database_path),
-        pairing_options=seq_options,
-        matching_options=matching_options,
-    )
-
-    if kill_check and kill_check():
-        logger.info("Job cancelled after matching")
-        return None
-
-    # ========== Step 5: Run reconstruction ==========
-    if mapper == "glomap":
-        # GLOMAP global mapping with rig support
-        logger.info("Running GLOMAP global mapping with rig support...")
-        
-        success = run_command([
-            "glomap", "mapper",
-            "--database_path", str(database_path),
-            "--image_path", str(image_dir),
-            "--output_path", str(sparse_path),
-            "--BundleAdjustment.optimize_rig_poses", "1",     # Optimize rig poses
-            "--BundleAdjustment.optimize_intrinsics", "0",    # Don't change virtual cam intrinsics
-            "--skip_view_graph_calibration", "1",             # Trust rig config
-            "--ba_iteration_num", "5",
-            "--skip_pruning", "0",
-        ], kill_check=kill_check)
-        
-        if not success:
-            logger.error("GLOMAP mapping failed!")
-            return None
-        
-        # Re-register images that may have been pruned
-        zero_dir = sparse_path / "0"
-        if zero_dir.exists():
-            logger.info("Running image registrator to recover pruned images...")
-            run_command([
-                "colmap", "image_registrator",
-                "--database_path", str(database_path),
-                "--input_path", str(zero_dir),
-                "--output_path", str(zero_dir),
-            ], kill_check=kill_check)
-    else:
-        # COLMAP incremental mapping with fixed rig poses
-        logger.info("Running COLMAP incremental mapping with rig constraints...")
-        opts = pycolmap.IncrementalPipelineOptions(
-            ba_refine_sensor_from_rig=False,  # Don't modify rig relative poses
-            ba_refine_focal_length=False,     # Virtual cams have perfect intrinsics
-            ba_refine_principal_point=False,
-            ba_refine_extra_params=False,
-        )
-        
-        recs = pycolmap.incremental_mapping(
-            str(database_path), str(image_dir), str(sparse_path), opts
-        )
-        
-        for idx, rec in recs.items():
-            logger.info(f"Reconstruction #{idx}: {rec.summary()}")
-        
-        if not recs:
-            logger.error("No reconstructions created!")
-            return None
-    
-    return sparse_path
 
 
 if __name__ == "__main__":
