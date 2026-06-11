@@ -2,7 +2,6 @@ import os
 import subprocess
 import argparse
 import logging
-from math import ceil
 logger = logging.getLogger(__name__)
 
 
@@ -32,6 +31,26 @@ def get_total_frames(video_path):
     return total_frames
 
 
+def get_duration(video_path):
+    """Uses ffprobe to get the video duration in seconds."""
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=nokey=1:noprint_wrappers=1",
+        video_path,
+    ]
+
+    try:
+        return float(subprocess.check_output(command).strip())
+    except (subprocess.CalledProcessError, ValueError):
+        logger.error(f"Error: Unable to retrieve duration from video {video_path}")
+        return None
+
+
 def extract_frames(video_path, output_dir, target_framecount=None, downscale=True, max_resolution=1920):
     """Extract frames using ffmpeg based on the target frame count.
 
@@ -46,20 +65,31 @@ def extract_frames(video_path, output_dir, target_framecount=None, downscale=Tru
     if total_frames is None:
         return
 
-    # Calculate the interval based on the target frame count
+    # When the video has more frames than the target, resample by timestamp to
+    # exactly the target count. A whole-frame stride (every Nth frame) only
+    # hits the target when total is an exact multiple — a 901-frame video with
+    # a 900 cap would yield 450. The fps filter strides fractionally; the rate
+    # is biased up by half a frame and -frames:v trims any overshoot, so the
+    # output is exactly target_framecount, evenly spaced, for any video length.
+    frame_limit = None
     if target_framecount and target_framecount < total_frames:
-        interval = max(1, ceil(total_frames / target_framecount))
+        duration = get_duration(video_path)
+        if not duration:
+            return
+        rate = (target_framecount + 0.5) / duration
+        video_filter_string = f"fps={rate:.6f}"
+        frame_limit = target_framecount
+        logger.info(
+            f"Resampling {total_frames} frames at {rate:.4f} fps to extract exactly {target_framecount} frames."
+        )
     else:
-        interval = 1  # If no target frame count is given or it's larger than total frames, extract every frame
+        # No target, or the video is at/under it: extract every frame.
+        video_filter_string = "select=not(mod(n\,1))"
+        logger.info(f"Extracting all {total_frames} frames (target {target_framecount}).")
 
     logger.info(f"Total frames in video: {total_frames}")
-    logger.info(
-        f"Extracting frames at an interval of {interval} to aim for {target_framecount} frames."
-    )
 
-    # ffmpeg command to extract frames at calculated intervals
     output_pattern = os.path.join(output_dir, "image_%04d.png")
-    video_filter_string = f"select=not(mod(n\,{interval}))"
     if downscale:
         video_filter_string += f",scale=if(gte(iw\,ih)\,min({max_resolution}\,iw)\,-2):if(lt(iw\,ih)\,min({max_resolution}\,ih)\,-2)"
     ffmpeg_command = [
@@ -72,6 +102,8 @@ def extract_frames(video_path, output_dir, target_framecount=None, downscale=Tru
         "vfr",
         output_pattern,
     ]
+    if frame_limit:
+        ffmpeg_command[-1:-1] = ["-frames:v", str(frame_limit)]
 
     try:
         subprocess.run(ffmpeg_command, check=True)
