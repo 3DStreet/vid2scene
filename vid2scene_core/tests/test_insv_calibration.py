@@ -65,6 +65,19 @@ OFFSET_V3_TEXT = "_".join(
     f"{v:.6f}" for v in [2.0] + OFFSET_V3_LENS0 + OFFSET_V3_LENS1
 )
 
+# X5 fw 1.9 offset_v3: 19 fields per lens (no per-lens flag) plus one
+# trailing file-level value. Verbatim from a real X5 recording
+# (fw v1.9.6_build1); note the ~90 deg nominal roll of the portrait-mounted
+# sensors and lens 1's cx in full dual-frame coordinates.
+OFFSET_V3_X5_TEXT = (
+    "2_2.000000_4280.730_4280.890_2693.330_2680.260_-0.467_0.351_90.426"
+    "_0.000000_0.000000_0.000000_0.18062226_2.09071612_-3.32824707"
+    "_-0.00253176_-0.00075190_10752_5376_113"
+    "_2.000000_4278.380_4278.480_8069.920_2688.010_0.560_0.096_89.252"
+    "_-0.001068_0.000384_-0.032249_0.17816089_2.12469268_-3.33294296"
+    "_-0.00017225_-0.00264012_10752_5376_113_197632"
+)
+
 
 def make_metadata_payload(offset_v3: str | None = OFFSET_V3_TEXT,
                           window_crop: bytes | None = None) -> bytes:
@@ -117,6 +130,20 @@ class TestParseOffsetV3:
         assert lens0["p2"] == pytest.approx(-0.0013)
         assert lens0["ref_width"] == pytest.approx(16000.0)
         assert lenses[1]["fx"] == pytest.approx(2868.0)
+
+    def test_parses_x5_19_field_blocks(self):
+        lenses = parse_offset_v3(OFFSET_V3_X5_TEXT)
+        assert len(lenses) == 2
+        lens0, lens1 = lenses
+        assert lens0["xi"] == pytest.approx(2.0)
+        assert lens0["fx"] == pytest.approx(4280.730)
+        assert lens0["roll_deg"] == pytest.approx(90.426)
+        assert lens0["ref_width"] == pytest.approx(10752)
+        assert lens0["ref_height"] == pytest.approx(5376)
+        assert "flag" not in lens0
+        assert lens1["fx"] == pytest.approx(4278.380)
+        assert lens1["cx"] == pytest.approx(8069.920)
+        assert lens1["lens_type"] == pytest.approx(113)
 
     def test_rejects_truncated_or_junk(self):
         assert parse_offset_v3("2_1.0_2.0_3.0") is None

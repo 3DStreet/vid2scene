@@ -74,7 +74,19 @@ def read_insv_trailer_records(path, max_records: int = 64) -> dict[int, bytes]:
                     break
                 f.seek(pos)
                 record_id, record_size = struct.unpack("<HI", f.read(6))
-                if record_id == 0 or record_size == 0 or record_size > pos:
+                if record_size == 0 or record_size > pos:
+                    break
+                if record_id == 0:
+                    # Newer trailers (seen on X5 fw 1.9.x; trailer version 3 in
+                    # the footer) chain an id-0 record at the top whose payload
+                    # is an index table, and records below it no longer follow
+                    # the strict payload+descriptor chain — so the table is
+                    # authoritative for everything else.
+                    f.seek(pos - record_size)
+                    table = f.read(record_size)
+                    records.update(
+                        _parse_trailer_index(f, table, file_size, footer)
+                    )
                     break
                 f.seek(pos - record_size)
                 records[record_id] = f.read(record_size)
@@ -83,6 +95,31 @@ def read_insv_trailer_records(path, max_records: int = 64) -> dict[int, bytes]:
     except (OSError, struct.error) as e:
         logger.warning(f"Could not parse .insv trailer of {path}: {e}")
         return {}
+
+
+def _parse_trailer_index(f, table: bytes, file_size: int, footer: bytes) -> dict[int, bytes]:
+    """Resolve a version-3 trailer index table into {record_id: payload}.
+
+    The table is the payload of the id-0 record: 10-byte entries of
+    (uint16 id, uint32 size, uint32 offset), offset relative to the trailer
+    data start (= EOF minus the trailer size stored in the footer). Zero or
+    out-of-range entries are slot padding and skipped. Small ids are the
+    legacy record ids shifted right by 8 (2 -> 0x200 preview, 3 -> 0x300
+    gyro, ...); 0x101 (file_info) keeps its legacy value.
+    """
+    trailer_size = struct.unpack("<I", footer[38:42])[0]
+    trailer_start = file_size - trailer_size
+    if not 0 < trailer_start < file_size:
+        return {}
+    records: dict[int, bytes] = {}
+    for entry_pos in range(0, len(table) - 9, 10):
+        rec_id, rec_size, rec_offset = struct.unpack_from("<HII", table, entry_pos)
+        if rec_id == 0 or rec_size == 0 or rec_offset + rec_size > trailer_size:
+            continue
+        legacy_id = rec_id if rec_id >= 0x100 else rec_id << 8
+        f.seek(trailer_start + rec_offset)
+        records[legacy_id] = f.read(rec_size)
+    return records
 
 
 def summarize_insv_metadata(records: dict[int, bytes]) -> dict:

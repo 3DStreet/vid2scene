@@ -32,12 +32,52 @@ def build_insv_trailer(records: list[tuple[int, bytes]]) -> bytes:
     return blob + footer
 
 
+def build_insv_trailer_v3(records: list[tuple[int, bytes]]) -> bytes:
+    """Build a synthetic version-3 trailer (seen on X5 fw 1.9).
+
+    Record payloads sit at the front of the trailer data region; an id-0
+    record chained at the top holds an index table of 10-byte
+    (uint16 id, uint32 size, uint32 offset) entries with offsets relative
+    to the data start, and small table ids are the legacy ids >> 8. The
+    footer carries the total trailer size and version 3.
+    """
+    data = b""
+    entries = b"\x00" * 10  # leading padding slot, as in real trailers
+    for record_id, payload in records:
+        table_id = record_id if record_id == 0x101 else record_id >> 8
+        entries += struct.pack("<HII", table_id, len(payload), len(data))
+        data += payload
+    body = data + entries
+    trailer_size = len(body) + 78
+    footer = (
+        struct.pack("<HI", 0, len(entries))
+        + b"\x00" * 32
+        + struct.pack("<II", trailer_size, 3)
+        + INSV_TRAILER_MAGIC
+    )
+    assert len(footer) == 78
+    return body + footer
+
+
 class TestTrailerParsing:
     def test_parses_records_walking_backwards(self, tmp_path):
         gyro = bytes(range(64))
         file_info = b"\x0a\x0cIAB123456789\x12\x0bInsta360 X4\x1a\x08v1.0.0.0"
         path = tmp_path / "video.insv"
         path.write_bytes(b"\x00" * 256 + build_insv_trailer([(0x300, gyro), (0x101, file_info)]))
+
+        records = read_insv_trailer_records(path)
+        assert records[0x101] == file_info
+        assert records[0x300] == gyro
+
+    def test_parses_v3_index_trailer(self, tmp_path):
+        gyro = bytes(range(48))
+        file_info = b"\x0a\x0eIAHYA2507QGEJ3\x12\x0bInsta360 X5\x1a\x08v1.9.6.0"
+        path = tmp_path / "video.insv"
+        path.write_bytes(
+            b"\x00" * 256
+            + build_insv_trailer_v3([(0x101, file_info), (0x300, gyro)])
+        )
 
         records = read_insv_trailer_records(path)
         assert records[0x101] == file_info

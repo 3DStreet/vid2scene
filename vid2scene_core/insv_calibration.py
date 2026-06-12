@@ -149,19 +149,39 @@ def _parse_float_list(text: str) -> list[float] | None:
 
 
 def parse_offset_v3(text: str) -> list[dict] | None:
-    """Parse the trailer's offset_v3 string into per-lens MEI lens specs."""
+    """Parse the trailer's offset_v3 string into per-lens MEI lens specs.
+
+    The per-lens field count varies by camera/firmware: X4-era trailers
+    write 20 fields (with a trailing per-lens flag), X5 fw 1.9 writes 19
+    (no flag) followed by file-level trailing values. Both layouts are
+    tried; the winner must put plausible values in the reference-dimension
+    slots (a misaligned block lands lens_type/flag-scale values there).
+    """
     values = _parse_float_list(text)
     if not values:
         return None
     num_lenses = int(values[0])
-    block = len(_OFFSET_V3_LENS_FIELDS)
-    if num_lenses < 1 or len(values) < 1 + num_lenses * block:
+    if num_lenses < 1:
         return None
-    lenses = []
-    for lens_idx in range(num_lenses):
-        fields = values[1 + lens_idx * block: 1 + (lens_idx + 1) * block]
-        lenses.append(dict(zip(_OFFSET_V3_LENS_FIELDS, fields)))
-    return lenses
+    for field_names in (_OFFSET_V3_LENS_FIELDS, _OFFSET_V3_LENS_FIELDS[:-1]):
+        block = len(field_names)
+        if len(values) < 1 + num_lenses * block:
+            continue
+        lenses = [
+            dict(zip(field_names, values[1 + i * block: 1 + (i + 1) * block]))
+            for i in range(num_lenses)
+        ]
+        if all(_offset_v3_lens_plausible(spec) for spec in lenses):
+            return lenses
+    return None
+
+
+def _offset_v3_lens_plausible(spec: dict) -> bool:
+    return (
+        spec["fx"] > 0
+        and spec["fy"] > 0
+        and spec["ref_width"] >= spec["ref_height"] >= 1000
+    )
 
 
 def parse_pb_calibration(data: bytes) -> list[dict] | None:
