@@ -65,6 +65,19 @@ OFFSET_V3_TEXT = "_".join(
     f"{v:.6f}" for v in [2.0] + OFFSET_V3_LENS0 + OFFSET_V3_LENS1
 )
 
+# X4 fw 1.9.21 offset_v3: also the 19-field layout (the 20-field X4 fixture
+# above matches older firmware). Verbatim from a real X4 recording; per-lens
+# landscape reference frame (8000x6000, no halving) with lens 1's cx in
+# 16000-wide full dual-frame coordinates.
+OFFSET_V3_X4_TEXT = (
+    "2_1.948170_4613.480_4613.680_4007.080_2999.740_-0.045_0.017_89.764"
+    "_0.000000_0.000000_0.000000_0.37750375_1.42040467_-4.14384651"
+    "_0.00027564_-0.00161791_8000_6000_71"
+    "_1.948170_4632.750_4632.940_12009.280_3005.090_0.015_0.177_89.567"
+    "_-0.001166_-0.000030_-0.032311_0.39006260_1.31805623_-4.07983112"
+    "_0.00039543_-0.00112667_8000_6000_71_197632"
+)
+
 # X5 fw 1.9 offset_v3: 19 fields per lens (no per-lens flag) plus one
 # trailing file-level value. Verbatim from a real X5 recording
 # (fw v1.9.6_build1); note the ~90 deg nominal roll of the portrait-mounted
@@ -144,6 +157,17 @@ class TestParseOffsetV3:
         assert lens1["fx"] == pytest.approx(4278.380)
         assert lens1["cx"] == pytest.approx(8069.920)
         assert lens1["lens_type"] == pytest.approx(113)
+
+    def test_parses_x4_fw19_19_field_blocks(self):
+        lenses = parse_offset_v3(OFFSET_V3_X4_TEXT)
+        assert len(lenses) == 2
+        assert lenses[0]["xi"] == pytest.approx(1.94817)
+        assert lenses[0]["fx"] == pytest.approx(4613.480)
+        assert lenses[0]["roll_deg"] == pytest.approx(89.764)
+        assert lenses[0]["ref_width"] == pytest.approx(8000)
+        assert lenses[0]["ref_height"] == pytest.approx(6000)
+        assert "flag" not in lenses[0]
+        assert lenses[1]["cx"] == pytest.approx(12009.280)
 
     def test_rejects_truncated_or_junk(self):
         assert parse_offset_v3("2_1.0_2.0_3.0") is None
