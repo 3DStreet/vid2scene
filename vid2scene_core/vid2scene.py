@@ -99,7 +99,9 @@ def parse_arguments():
     parser.add_argument(
         "--insv_no_factory_calibration",
         help="Ignore Insta360's per-unit factory lens calibration embedded in "
-             "the .insv recording and use the idealized lens model instead.",
+             "the .insv recording and use the idealized lens model instead. "
+             "Without this flag, an .insv whose calibration cannot be parsed "
+             "fails early instead of silently degrading.",
         action="store_true",
         default=False,
     )
@@ -549,7 +551,9 @@ def process_video_to_scene(
         insv_calibration: Path to a lens calibration JSON, overriding the factory
             calibration (see docs/insv_fisheye.md)
         insv_no_factory_calibration: Ignore the per-unit factory calibration
-            embedded in the recording and use the idealized lens model
+            embedded in the recording and use the idealized lens model.
+            Without it, unparseable calibration fails the job early
+            (FactoryCalibrationError) instead of silently degrading
         use_background_sphere: Whether to use a background sphere
         apply_pilgram_filter_name: Name of Pilgram filter to apply (if any)
         training_max_num_gaussians: Maximum number of Gaussians to use in Gsplat

@@ -12,11 +12,13 @@ pitch. Cropping pinhole views directly from the fisheye sources keeps native
 sensor pixels everywhere, and the default view grid points views down past the
 nadir, so the ground is covered by up to 6 views per frame pair instead of 0.
 
-Lens intrinsics come from Insta360's per-unit factory calibration when it can
-be parsed out of the recording (insv_calibration.py: the trailer's offset_v3
-or the .insv.pb sidecar, both MEI camera models). An explicit calibration
-JSON (--insv_calibration) overrides it; with neither, an idealized
-equidistant fisheye is assumed (see docs/insv_fisheye.md).
+Lens intrinsics come from Insta360's per-unit factory calibration parsed out
+of the recording (insv_calibration.py: the trailer's offset_v3 or the
+.insv.pb sidecar, both MEI camera models). An explicit calibration JSON
+(--insv_calibration) overrides it. If neither parses, the job FAILS EARLY
+(FactoryCalibrationError, before any heavy work) rather than degrading; the
+idealized equidistant fisheye is an explicit opt-in via
+--no_factory_calibration (see docs/insv_fisheye.md).
 """
 
 import argparse
@@ -414,9 +416,19 @@ def run_insv_sfm(
                 f"from {factory['source']}"
             )
         else:
-            logger.info(
-                "No factory lens calibration found in the recording; "
-                "using the idealized lens model (see docs/insv_fisheye.md)"
+            # Fail fast — before frame extraction, rendering, SfM, or
+            # training spend anything. The idealized model doesn't know about
+            # the ~90 deg portrait-sensor roll real X4/X5 units have, so a
+            # silent fallback would burn the whole job on a rig that can't
+            # register. The insv_calibration warnings logged just above say
+            # exactly which parsing rung broke.
+            raise insv_calibration.FactoryCalibrationError(
+                "No usable Insta360 factory lens calibration in this "
+                "recording (no .insv.pb sidecar; trailer offset_v3 missing "
+                "or unparseable — see preceding log lines for the trailer "
+                "contents). Pass --insv_no_factory_calibration to explicitly "
+                "reconstruct with the idealized lens model, or provide a "
+                "calibration JSON (see docs/insv_fisheye.md)."
             )
 
     if kill_check and kill_check():

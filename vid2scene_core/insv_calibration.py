@@ -48,6 +48,19 @@ logger = logging.getLogger(__name__)
 # with format=1 (protobuf) and id=1 (metadata).
 METADATA_RECORD_KEY = 0x101
 
+
+class FactoryCalibrationError(RuntimeError):
+    """No usable factory lens calibration in an .insv recording.
+
+    Raised by the pipeline when factory calibration is required (the default
+    for .insv jobs) but could not be parsed. Reconstructing with the
+    idealized lens model instead is an explicit opt-in
+    (--insv_no_factory_calibration), never a silent fallback: real X4/X5
+    sensors are portrait-mounted (~90 deg roll), which the idealized model
+    does not know about, so a silent fallback wastes a full SfM+training run
+    on a geometry that cannot register.
+    """
+
 _METADATA_STRING_FIELDS = {
     1: "serial_number",
     2: "camera_type",
@@ -317,8 +330,34 @@ def load_factory_calibration(insv_path, trailer_records: dict[int, bytes]) -> di
         lenses = parse_offset_v3(metadata["offset_v3"])
         if lenses:
             source = ".insv trailer offset_v3"
+        else:
+            # Log the raw string verbatim: an unparseable offset_v3 means a
+            # layout this code doesn't know yet (the X4-era 20-field vs X5
+            # fw1.9 19-field split was exactly this), and the string itself
+            # is everything needed to add support for it.
+            logger.warning(
+                "Trailer offset_v3 present but unparseable (unknown field "
+                f"layout?): {metadata['offset_v3']}"
+            )
 
     if not lenses:
+        # Spell out which rung of the calibration ladder broke, so a failed
+        # job's log pinpoints the fix without needing the recording in hand.
+        if not trailer_records:
+            logger.warning(
+                "No .insv trailer records found (trailer missing or its "
+                "layout did not parse)"
+            )
+        elif METADATA_RECORD_KEY not in trailer_records:
+            logger.warning(
+                "Trailer has no file_info record (0x101); records present: "
+                f"{[hex(key) for key in sorted(trailer_records)]}"
+            )
+        elif not metadata.get("offset_v3"):
+            logger.warning(
+                "file_info record carries no offset_v3 calibration string; "
+                f"fields present: {sorted(metadata)}"
+            )
         return None
     if len(lenses) != 2:
         logger.warning(

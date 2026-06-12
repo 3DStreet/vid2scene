@@ -1,4 +1,5 @@
 import base64
+import logging
 
 import numpy as np
 import pytest
@@ -303,6 +304,35 @@ class TestLoadFactoryCalibration:
         records = {METADATA_RECORD_KEY: make_metadata_payload(offset_v3=None)}
         assert load_factory_calibration(tmp_path / "video.insv", records) is None
         assert load_factory_calibration(tmp_path / "video.insv", {}) is None
+
+    # The pipeline fails an .insv job hard when calibration cannot be parsed,
+    # so these warnings are the debugging surface — each rung of the ladder
+    # must say which step broke and carry the raw data needed to fix it.
+    def test_logs_which_rung_broke(self, tmp_path, caplog):
+        path = tmp_path / "video.insv"
+        with caplog.at_level(logging.WARNING):
+            load_factory_calibration(path, {})
+        assert "No .insv trailer records" in caplog.text
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            load_factory_calibration(path, {0x300: b"\x00"})
+        assert "no file_info record" in caplog.text
+        assert "0x300" in caplog.text
+
+        caplog.clear()
+        records = {METADATA_RECORD_KEY: make_metadata_payload(offset_v3=None)}
+        with caplog.at_level(logging.WARNING):
+            load_factory_calibration(path, records)
+        assert "no offset_v3" in caplog.text
+
+    def test_logs_raw_string_when_offset_v3_unparseable(self, tmp_path, caplog):
+        bad = "2_1.0_2.0_3.0"
+        records = {METADATA_RECORD_KEY: make_metadata_payload(offset_v3=bad)}
+        with caplog.at_level(logging.WARNING):
+            assert load_factory_calibration(tmp_path / "video.insv", records) is None
+        assert "unparseable" in caplog.text
+        assert bad in caplog.text  # verbatim — it's the fix-enabling data
 
 
 class TestMountCorrections:
